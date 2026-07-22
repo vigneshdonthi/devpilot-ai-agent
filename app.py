@@ -132,16 +132,12 @@ def switch_chat(chat_id):
 def delete_chat(chat_id):
 
     if chat_id in st.session_state.chats:
-
         del st.session_state.chats[chat_id]
 
-
     if not st.session_state.chats:
-
         create_new_chat()
 
     else:
-
         st.session_state.current_chat_id = next(
             reversed(st.session_state.chats)
         )
@@ -215,7 +211,6 @@ with st.sidebar:
     ):
 
         create_new_chat()
-
         st.rerun()
 
 
@@ -238,6 +233,8 @@ with st.sidebar:
 
         st.session_state.package_action = False
 
+        st.rerun()
+
 
     if st.button(
         "📖 Explain GitHub Code",
@@ -248,11 +245,16 @@ with st.sidebar:
 
         st.session_state.package_action = False
 
+        st.rerun()
+
 
     if st.button(
         "🔍 Review Project",
         use_container_width=True,
     ):
+
+        st.session_state.github_action = None
+        st.session_state.package_action = False
 
         run_prompt(
             "Analyze my current Python project. "
@@ -261,17 +263,24 @@ with st.sidebar:
             "problems and recommendations."
         )
 
+        st.rerun()
+
 
     if st.button(
         "📦 Check Dependencies",
         use_container_width=True,
     ):
 
+        st.session_state.github_action = None
+        st.session_state.package_action = False
+
         run_prompt(
             "Analyze my current project's requirements.txt "
             "and identify missing, duplicate, unpinned or "
             "problematic dependencies."
         )
+
+        st.rerun()
 
 
     if st.button(
@@ -282,6 +291,8 @@ with st.sidebar:
         st.session_state.package_action = True
 
         st.session_state.github_action = None
+
+        st.rerun()
 
 
     st.divider()
@@ -305,9 +316,7 @@ with st.sidebar:
 
         title = saved_chat["title"]
 
-
         if chat_id == st.session_state.current_chat_id:
-
             title = "● " + title
 
 
@@ -381,7 +390,8 @@ st.markdown(
 # MODE SELECTOR
 # =========================================================
 
-# Mode can only be selected before the conversation starts.
+# The user can choose the mode only before the
+# first message is sent.
 
 if not messages:
 
@@ -402,12 +412,9 @@ if not messages:
 
 
     if mode == "⚡ Agent":
-
         chat["mode"] = "Agent"
 
-
     elif mode == "💬 Chat":
-
         chat["mode"] = "Chat"
 
 
@@ -423,7 +430,6 @@ if not messages:
             "⚡ **Agent Mode** — DevPilot can reason about "
             "your task and autonomously use developer tools."
         )
-
 
     else:
 
@@ -472,17 +478,26 @@ if not messages:
 
                 st.session_state.github_action = "architecture"
 
+                st.session_state.package_action = False
+
+                st.rerun()
+
 
             if st.button(
                 "📦 Analyze Dependencies",
                 use_container_width=True,
             ):
 
+                st.session_state.github_action = None
+                st.session_state.package_action = False
+
                 run_prompt(
                     "Analyze my current project's "
                     "dependencies and identify potential "
                     "problems."
                 )
+
+                st.rerun()
 
 
         with col2:
@@ -492,10 +507,15 @@ if not messages:
                 use_container_width=True,
             ):
 
+                st.session_state.github_action = None
+                st.session_state.package_action = False
+
                 run_prompt(
                     "Analyze my current Python project "
                     "and give me a code quality report."
                 )
+
+                st.rerun()
 
 
             if st.button(
@@ -504,6 +524,10 @@ if not messages:
             ):
 
                 st.session_state.github_action = "code"
+
+                st.session_state.package_action = False
+
+                st.rerun()
 
 
     # =====================================================
@@ -543,6 +567,8 @@ if not messages:
                     "with an example."
                 )
 
+                st.rerun()
+
 
             if st.button(
                 "🐍 Teach me Python",
@@ -553,6 +579,8 @@ if not messages:
                     "Teach me an important intermediate "
                     "Python concept with a simple example."
                 )
+
+                st.rerun()
 
 
         with col2:
@@ -567,6 +595,8 @@ if not messages:
                     "developers use it."
                 )
 
+                st.rerun()
+
 
             if st.button(
                 "🤖 LLM vs AI Agent",
@@ -578,18 +608,70 @@ if not messages:
                     "LLM and an AI agent simply."
                 )
 
+                st.rerun()
+
 
 # =========================================================
-# GITHUB QUICK ACTION FORM
+# DISPLAY EXISTING CHAT
 # =========================================================
+
+# IMPORTANT:
+# Messages are rendered BEFORE GitHub / PyPI forms.
+#
+# Therefore, if the user selects a quick action while
+# already chatting, the action appears at the current
+# bottom of the conversation.
+
+for message in messages:
+
+    with st.chat_message(
+        message["role"]
+    ):
+
+        st.markdown(
+            message["content"]
+        )
+
+
+# =========================================================
+# GITHUB QUICK ACTION
+# =========================================================
+
+# This intentionally comes AFTER existing messages.
 
 if st.session_state.github_action:
 
     action = st.session_state.github_action
 
 
+    if action == "architecture":
+
+        st.markdown(
+            "#### 🐙 Explore GitHub Repository"
+        )
+
+        st.caption(
+            "Enter a public GitHub repository and "
+            "DevPilot will explore its structure."
+        )
+
+
+    elif action == "code":
+
+        st.markdown(
+            "#### 📖 Explain GitHub Source Code"
+        )
+
+        st.caption(
+            "Enter a public GitHub repository and "
+            "DevPilot will find and explain its "
+            "main implementation code."
+        )
+
+
     with st.form(
-        "github_form"
+        "github_form",
+        clear_on_submit=True,
     ):
 
         repository_url = st.text_input(
@@ -600,10 +682,33 @@ if st.session_state.github_action:
         )
 
 
-        analyze_repo = st.form_submit_button(
-            "Analyze Repository",
-            type="primary",
+        col1, col2 = st.columns(
+            [1, 1]
         )
+
+
+        with col1:
+
+            analyze_repo = st.form_submit_button(
+                "Analyze Repository",
+                type="primary",
+                use_container_width=True,
+            )
+
+
+        with col2:
+
+            cancel_github = st.form_submit_button(
+                "Cancel",
+                use_container_width=True,
+            )
+
+
+        if cancel_github:
+
+            st.session_state.github_action = None
+
+            st.rerun()
 
 
         if analyze_repo:
@@ -611,7 +716,14 @@ if st.session_state.github_action:
             repository_url = repository_url.strip()
 
 
-            if repository_url:
+            if not repository_url:
+
+                st.warning(
+                    "Enter a GitHub repository URL."
+                )
+
+
+            else:
 
                 if action == "architecture":
 
@@ -636,22 +748,30 @@ if st.session_state.github_action:
 
                 st.session_state.github_action = None
 
-
-            else:
-
-                st.warning(
-                    "Enter a GitHub repository URL."
-                )
+                st.rerun()
 
 
 # =========================================================
-# PYPI QUICK ACTION FORM
+# PYPI QUICK ACTION
 # =========================================================
+
+# This also intentionally comes AFTER existing messages.
 
 if st.session_state.package_action:
 
+    st.markdown(
+        "#### 🔄 Check PyPI Package"
+    )
+
+    st.caption(
+        "Enter a Python package and DevPilot will "
+        "check its latest PyPI information."
+    )
+
+
     with st.form(
-        "package_form"
+        "package_form",
+        clear_on_submit=True,
     ):
 
         package_name = st.text_input(
@@ -660,10 +780,33 @@ if st.session_state.package_action:
         )
 
 
-        check_package = st.form_submit_button(
-            "Check Package",
-            type="primary",
+        col1, col2 = st.columns(
+            [1, 1]
         )
+
+
+        with col1:
+
+            check_package = st.form_submit_button(
+                "Check Package",
+                type="primary",
+                use_container_width=True,
+            )
+
+
+        with col2:
+
+            cancel_package = st.form_submit_button(
+                "Cancel",
+                use_container_width=True,
+            )
+
+
+        if cancel_package:
+
+            st.session_state.package_action = False
+
+            st.rerun()
 
 
         if check_package:
@@ -671,7 +814,14 @@ if st.session_state.package_action:
             package_name = package_name.strip()
 
 
-            if package_name:
+            if not package_name:
+
+                st.warning(
+                    "Enter a Python package name."
+                )
+
+
+            else:
 
                 run_prompt(
                     "Check the latest PyPI version of "
@@ -682,27 +832,7 @@ if st.session_state.package_action:
 
                 st.session_state.package_action = False
 
-
-            else:
-
-                st.warning(
-                    "Enter a Python package name."
-                )
-
-
-# =========================================================
-# DISPLAY EXISTING CHAT
-# =========================================================
-
-for message in messages:
-
-    with st.chat_message(
-        message["role"]
-    ):
-
-        st.markdown(
-            message["content"]
-        )
+                st.rerun()
 
 
 # =========================================================
@@ -717,8 +847,6 @@ prompt = st.chat_input(
 # =========================================================
 # HANDLE QUICK PROMPTS
 # =========================================================
-
-# Complete starter prompts execute immediately.
 
 if st.session_state.pending_prompt:
 
@@ -771,7 +899,7 @@ if prompt:
 
 
         # =================================================
-        # DEV PILOT RESPONSE
+        # DEVPILOT RESPONSE
         # =================================================
 
         with st.chat_message("assistant"):
@@ -835,7 +963,6 @@ if prompt:
                                 data,
                                 dict
                             ):
-
                                 continue
 
 
@@ -845,7 +972,6 @@ if prompt:
                                     update,
                                     dict
                                 ):
-
                                     continue
 
 
@@ -923,7 +1049,6 @@ if prompt:
                                 data,
                                 tuple
                             ):
-
                                 continue
 
 
@@ -936,7 +1061,6 @@ if prompt:
                                 )
                                 == "tools"
                             ):
-
                                 continue
 
 
@@ -992,7 +1116,7 @@ if prompt:
 
 
                     # =========================================
-                    # COMPLETE
+                    # COMPLETE STATUS
                     # =========================================
 
                     if tools_seen:
@@ -1069,10 +1193,6 @@ if prompt:
                             }
                         )
 
-
-                    # =========================================
-                    # STREAM DEVPILOT RESPONSE
-                    # =========================================
 
                     for chunk in model.stream(
                         chat_messages
