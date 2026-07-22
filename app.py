@@ -1,8 +1,30 @@
+import os
+import shutil
+import tempfile
 import uuid
+import zipfile
+from pathlib import Path
 
 import streamlit as st
 
 from agent import agent, model
+
+
+# =========================================================
+# CONFIG
+# =========================================================
+
+MAX_ZIP_SIZE_MB = 50
+MAX_EXTRACTED_SIZE_MB = 150
+MAX_FILES = 2000
+
+IGNORED_FOLDERS = {
+    ".git",
+    ".venv",
+    "venv",
+    "__pycache__",
+    "node_modules",
+}
 
 
 # =========================================================
@@ -92,6 +114,11 @@ if "package_action" not in st.session_state:
     st.session_state.package_action = False
 
 
+# Keep temporary uploaded projects alive during this session.
+if "uploaded_projects" not in st.session_state:
+    st.session_state.uploaded_projects = {}
+
+
 # =========================================================
 # CHAT FUNCTIONS
 # =========================================================
@@ -134,6 +161,22 @@ def delete_chat(chat_id):
     if chat_id in st.session_state.chats:
         del st.session_state.chats[chat_id]
 
+    # Remove temporary uploaded project belonging to this chat.
+    project_data = st.session_state.uploaded_projects.pop(
+        chat_id,
+        None,
+    )
+
+    if project_data:
+
+        temp_directory = project_data.get("temp_directory")
+
+        if temp_directory and os.path.isdir(temp_directory):
+            shutil.rmtree(
+                temp_directory,
+                ignore_errors=True,
+            )
+
     if not st.session_state.chats:
         create_new_chat()
 
@@ -146,6 +189,306 @@ def delete_chat(chat_id):
 def run_prompt(prompt):
 
     st.session_state.pending_prompt = prompt
+
+
+# =========================================================
+# ZIP FUNCTIONS
+# =========================================================
+
+def is_ignored_path(path_parts):
+
+    return any(
+        part in IGNORED_FOLDERS
+        for part in path_parts
+    )
+
+
+def get_actual_project_root(extract_directory):
+
+    """
+    If the ZIP contains one root folder:
+
+        project.zip
+            my-project/
+                app.py
+
+    return my-project instead of the extraction directory.
+    """
+
+    items = [
+        item
+        for item in os.listdir(extract_directory)
+        if item not in {"__MACOSX"}
+    ]
+
+    if len(items) == 1:
+
+        possible_root = os.path.join(
+            extract_directory,
+            items[0],
+        )
+
+        if os.path.isdir(possible_root):
+            return possible_root
+
+    return extract_directory
+
+
+def extract_uploaded_project(uploaded_file):
+
+    """
+    Safely extract an uploaded ZIP into a temporary directory.
+
+    Returns:
+        (project_path, temp_directory)
+    """
+
+    if uploaded_file is None:
+        raise ValueError("No ZIP file was uploaded.")
+
+    # -----------------------------------------------------
+    # CHECK ZIP SIZE
+    # -----------------------------------------------------
+
+    uploaded_file.seek(0, os.SEEK_END)
+
+    zip_size = uploaded_file.tell()
+
+    uploaded_file.seek(0)
+
+    max_zip_bytes = (
+        MAX_ZIP_SIZE_MB
+        * 1024
+        * 1024
+    )
+
+    if zip_size > max_zip_bytes:
+
+        raise ValueError(
+            f"ZIP file is too large. "
+            f"Maximum allowed size is "
+            f"{MAX_ZIP_SIZE_MB} MB."
+        )
+
+    # -----------------------------------------------------
+    # CREATE TEMP DIRECTORY
+    # -----------------------------------------------------
+
+    temp_directory = tempfile.mkdtemp(
+        prefix="devpilot_"
+    )
+
+    extract_directory = os.path.join(
+        temp_directory,
+        "project",
+    )
+
+    os.makedirs(
+        extract_directory,
+        exist_ok=True,
+    )
+
+    extracted_size = 0
+    extracted_files = 0
+
+    max_extracted_bytes = (
+        MAX_EXTRACTED_SIZE_MB
+        * 1024
+        * 1024
+    )
+
+    try:
+
+        with zipfile.ZipFile(
+            uploaded_file,
+            "r",
+        ) as zip_file:
+
+            # ---------------------------------------------
+            # VALIDATE ZIP
+            # ---------------------------------------------
+
+            for member in zip_file.infolist():
+
+                member_path = Path(member.filename)
+
+                # Reject absolute paths.
+                if member_path.is_absolute():
+                    raise ValueError(
+                        "Unsafe ZIP file detected."
+                    )
+
+                # Reject ../ path traversal.
+                if ".." in member_path.parts:
+                    raise ValueError(
+                        "Unsafe ZIP file detected."
+                    )
+
+                # Ignore unnecessary folders.
+                if is_ignored_path(
+                    member_path.parts
+                ):
+                    continue
+
+                if member.is_dir():
+                    continue
+
+                extracted_files += 1
+
+                if extracted_files > MAX_FILES:
+
+                    raise ValueError(
+                        "Repository contains too many files. "
+                        f"Maximum allowed is {MAX_FILES}."
+                    )
+
+                extracted_size += member.file_size
+
+                if (
+                    extracted_size
+                    > max_extracted_bytes
+                ):
+
+                    raise ValueError(
+                        "Extracted project is too large. "
+                        f"Maximum allowed size is "
+                        f"{MAX_EXTRACTED_SIZE_MB} MB."
+                    )
+
+            # ---------------------------------------------
+            # EXTRACT FILES MANUALLY
+            # ---------------------------------------------
+
+            for member in zip_file.infolist():
+
+                member_path = Path(member.filename)
+
+                if member_path.is_absolute():
+                    continue
+
+                if ".." in member_path.parts:
+                    continue
+
+                if is_ignored_path(
+                    member_path.parts
+                ):
+                    continue
+
+                destination = os.path.abspath(
+                    os.path.join(
+                        extract_directory,
+                        member.filename,
+                    )
+                )
+
+                extract_root = os.path.abspath(
+                    extract_directory
+                )
+
+                # Extra path traversal protection.
+                if os.path.commonpath(
+                    [extract_root, destination]
+                ) != extract_root:
+
+                    raise ValueError(
+                        "Unsafe ZIP path detected."
+                    )
+
+                if member.is_dir():
+
+                    os.makedirs(
+                        destination,
+                        exist_ok=True,
+                    )
+
+                    continue
+
+                os.makedirs(
+                    os.path.dirname(destination),
+                    exist_ok=True,
+                )
+
+                with zip_file.open(
+                    member,
+                    "r",
+                ) as source:
+
+                    with open(
+                        destination,
+                        "wb",
+                    ) as target:
+
+                        shutil.copyfileobj(
+                            source,
+                            target,
+                        )
+
+        project_path = get_actual_project_root(
+            extract_directory
+        )
+
+        return (
+            project_path,
+            temp_directory,
+        )
+
+    except Exception:
+
+        shutil.rmtree(
+            temp_directory,
+            ignore_errors=True,
+        )
+
+        raise
+
+
+def save_uploaded_project(uploaded_file):
+
+    """
+    Extract the project and associate it with the
+    current chat.
+    """
+
+    chat_id = st.session_state.current_chat_id
+
+    # Remove previous uploaded project for this chat.
+    old_project = (
+        st.session_state.uploaded_projects.get(
+            chat_id
+        )
+    )
+
+    if old_project:
+
+        old_temp_directory = old_project.get(
+            "temp_directory"
+        )
+
+        if (
+            old_temp_directory
+            and os.path.isdir(old_temp_directory)
+        ):
+
+            shutil.rmtree(
+                old_temp_directory,
+                ignore_errors=True,
+            )
+
+    project_path, temp_directory = (
+        extract_uploaded_project(
+            uploaded_file
+        )
+    )
+
+    st.session_state.uploaded_projects[
+        chat_id
+    ] = {
+        "project_path": project_path,
+        "temp_directory": temp_directory,
+        "filename": uploaded_file.name,
+    }
+
+    return project_path
 
 
 # =========================================================
@@ -170,7 +513,9 @@ User message:
 {prompt}
 """
 
-        response = model.invoke(title_prompt)
+        response = model.invoke(
+            title_prompt
+        )
 
         title = response.content.strip()
 
@@ -186,7 +531,10 @@ User message:
 
         words = prompt.split()
 
-        return " ".join(words[:4]) or "New Chat"
+        return (
+            " ".join(words[:4])
+            or "New Chat"
+        )
 
 
 # =========================================================
@@ -197,7 +545,9 @@ with st.sidebar:
 
     st.markdown("## ⚡ DevPilot")
 
-    st.caption("AI Developer Assistant")
+    st.caption(
+        "AI Developer Assistant"
+    )
 
 
     # -----------------------------------------------------
@@ -211,6 +561,7 @@ with st.sidebar:
     ):
 
         create_new_chat()
+
         st.rerun()
 
 
@@ -221,7 +572,9 @@ with st.sidebar:
     # QUICK ACTIONS
     # -----------------------------------------------------
 
-    st.markdown("### ⚡ Quick Actions")
+    st.markdown(
+        "### ⚡ Quick Actions"
+    )
 
 
     if st.button(
@@ -229,7 +582,9 @@ with st.sidebar:
         use_container_width=True,
     ):
 
-        st.session_state.github_action = "architecture"
+        st.session_state.github_action = (
+            "architecture"
+        )
 
         st.session_state.package_action = False
 
@@ -253,15 +608,9 @@ with st.sidebar:
         use_container_width=True,
     ):
 
-        st.session_state.github_action = None
-        st.session_state.package_action = False
+        st.session_state.github_action = "review"
 
-        run_prompt(
-            "Analyze my current Python project. "
-            "Inspect its structure, source code and "
-            "dependencies. Give me the most important "
-            "problems and recommendations."
-        )
+        st.session_state.package_action = False
 
         st.rerun()
 
@@ -271,14 +620,11 @@ with st.sidebar:
         use_container_width=True,
     ):
 
-        st.session_state.github_action = None
-        st.session_state.package_action = False
-
-        run_prompt(
-            "Analyze my current project's requirements.txt "
-            "and identify missing, duplicate, unpinned or "
-            "problematic dependencies."
+        st.session_state.github_action = (
+            "dependencies"
         )
+
+        st.session_state.package_action = False
 
         st.rerun()
 
@@ -302,7 +648,9 @@ with st.sidebar:
     # RECENT CHATS
     # -----------------------------------------------------
 
-    st.markdown("### 💬 Recent Chats")
+    st.markdown(
+        "### 💬 Recent Chats"
+    )
 
 
     chat_items = list(
@@ -316,7 +664,11 @@ with st.sidebar:
 
         title = saved_chat["title"]
 
-        if chat_id == st.session_state.current_chat_id:
+        if (
+            chat_id
+            == st.session_state.current_chat_id
+        ):
+
             title = "● " + title
 
 
@@ -390,9 +742,6 @@ st.markdown(
 # MODE SELECTOR
 # =========================================================
 
-# The user can choose the mode only before the
-# first message is sent.
-
 if not messages:
 
     mode = st.segmented_control(
@@ -403,11 +752,17 @@ if not messages:
         ],
         default=(
             "⚡ Agent"
-            if chat.get("mode", "Agent") == "Agent"
+            if chat.get(
+                "mode",
+                "Agent"
+            ) == "Agent"
             else "💬 Chat"
         ),
         selection_mode="single",
-        key=f"mode_{st.session_state.current_chat_id}",
+        key=(
+            f"mode_"
+            f"{st.session_state.current_chat_id}"
+        ),
     )
 
 
@@ -427,15 +782,17 @@ if not messages:
     if chat["mode"] == "Agent":
 
         st.caption(
-            "⚡ **Agent Mode** — DevPilot can reason about "
-            "your task and autonomously use developer tools."
+            "⚡ **Agent Mode** — DevPilot can reason "
+            "about your task and autonomously use "
+            "developer tools."
         )
 
     else:
 
         st.caption(
-            "💬 **Chat Mode** — Chat directly with DevPilot "
-            "for programming, AI and general questions."
+            "💬 **Chat Mode** — Chat directly with "
+            "DevPilot for programming, AI and "
+            "general questions."
         )
 
 
@@ -476,7 +833,9 @@ if not messages:
                 use_container_width=True,
             ):
 
-                st.session_state.github_action = "architecture"
+                st.session_state.github_action = (
+                    "architecture"
+                )
 
                 st.session_state.package_action = False
 
@@ -488,14 +847,11 @@ if not messages:
                 use_container_width=True,
             ):
 
-                st.session_state.github_action = None
-                st.session_state.package_action = False
-
-                run_prompt(
-                    "Analyze my current project's "
-                    "dependencies and identify potential "
-                    "problems."
+                st.session_state.github_action = (
+                    "dependencies"
                 )
+
+                st.session_state.package_action = False
 
                 st.rerun()
 
@@ -507,13 +863,11 @@ if not messages:
                 use_container_width=True,
             ):
 
-                st.session_state.github_action = None
-                st.session_state.package_action = False
-
-                run_prompt(
-                    "Analyze my current Python project "
-                    "and give me a code quality report."
+                st.session_state.github_action = (
+                    "review"
                 )
+
+                st.session_state.package_action = False
 
                 st.rerun()
 
@@ -615,13 +969,6 @@ if not messages:
 # DISPLAY EXISTING CHAT
 # =========================================================
 
-# IMPORTANT:
-# Messages are rendered BEFORE GitHub / PyPI forms.
-#
-# Therefore, if the user selects a quick action while
-# already chatting, the action appears at the current
-# bottom of the conversation.
-
 for message in messages:
 
     with st.chat_message(
@@ -634,15 +981,17 @@ for message in messages:
 
 
 # =========================================================
-# GITHUB QUICK ACTION
+# PROJECT / GITHUB QUICK ACTION
 # =========================================================
-
-# This intentionally comes AFTER existing messages.
 
 if st.session_state.github_action:
 
     action = st.session_state.github_action
 
+
+    # -----------------------------------------------------
+    # EXPLORE GITHUB
+    # -----------------------------------------------------
 
     if action == "architecture":
 
@@ -656,6 +1005,93 @@ if st.session_state.github_action:
         )
 
 
+        with st.form(
+            "github_architecture_form",
+            clear_on_submit=True,
+        ):
+
+            repository_url = st.text_input(
+                "GitHub repository URL",
+                placeholder=(
+                    "https://github.com/pallets/flask"
+                ),
+            )
+
+
+            col1, col2 = st.columns(2)
+
+
+            with col1:
+
+                submit = st.form_submit_button(
+                    "Analyze Repository",
+                    type="primary",
+                    use_container_width=True,
+                )
+
+
+            with col2:
+
+                cancel = st.form_submit_button(
+                    "Cancel",
+                    use_container_width=True,
+                )
+
+
+            if cancel:
+
+                st.session_state.github_action = None
+
+                st.rerun()
+
+
+            if submit:
+
+                repository_url = (
+                    repository_url.strip()
+                )
+
+
+                if not repository_url:
+
+                    st.warning(
+                        "Enter a GitHub repository URL."
+                    )
+
+
+                elif not repository_url.startswith(
+                    (
+                        "https://github.com/",
+                        "http://github.com/",
+                    )
+                ):
+
+                    st.warning(
+                        "Enter a valid GitHub repository URL."
+                    )
+
+
+                else:
+
+                    run_prompt(
+                        "Explore this GitHub repository. "
+                        "Use the GitHub repository tools to "
+                        "inspect its actual repository tree. "
+                        "Identify important files and "
+                        "directories and explain the project "
+                        "architecture. Do not invent files: "
+                        f"{repository_url}"
+                    )
+
+                    st.session_state.github_action = None
+
+                    st.rerun()
+
+
+    # -----------------------------------------------------
+    # EXPLAIN GITHUB CODE
+    # -----------------------------------------------------
+
     elif action == "code":
 
         st.markdown(
@@ -664,98 +1100,439 @@ if st.session_state.github_action:
 
         st.caption(
             "Enter a public GitHub repository and "
-            "DevPilot will find and explain its "
-            "main implementation code."
+            "DevPilot will inspect and explain its "
+            "implementation."
         )
 
 
-    with st.form(
-        "github_form",
-        clear_on_submit=True,
-    ):
+        with st.form(
+            "github_code_form",
+            clear_on_submit=True,
+        ):
 
-        repository_url = st.text_input(
-            "GitHub repository URL",
-            placeholder=(
-                "https://github.com/pallets/flask"
-            ),
-        )
-
-
-        col1, col2 = st.columns(
-            [1, 1]
-        )
-
-
-        with col1:
-
-            analyze_repo = st.form_submit_button(
-                "Analyze Repository",
-                type="primary",
-                use_container_width=True,
+            repository_url = st.text_input(
+                "GitHub repository URL",
+                placeholder=(
+                    "https://github.com/pallets/flask"
+                ),
             )
 
 
-        with col2:
-
-            cancel_github = st.form_submit_button(
-                "Cancel",
-                use_container_width=True,
-            )
+            col1, col2 = st.columns(2)
 
 
-        if cancel_github:
+            with col1:
 
-            st.session_state.github_action = None
-
-            st.rerun()
-
-
-        if analyze_repo:
-
-            repository_url = repository_url.strip()
-
-
-            if not repository_url:
-
-                st.warning(
-                    "Enter a GitHub repository URL."
+                submit = st.form_submit_button(
+                    "Explain Code",
+                    type="primary",
+                    use_container_width=True,
                 )
 
 
-            else:
+            with col2:
 
-                if action == "architecture":
-
-                    run_prompt(
-                        "Explore this GitHub repository, "
-                        "identify the important files and "
-                        "explain its architecture: "
-                        f"{repository_url}"
-                    )
+                cancel = st.form_submit_button(
+                    "Cancel",
+                    use_container_width=True,
+                )
 
 
-                elif action == "code":
-
-                    run_prompt(
-                        "Explore this GitHub repository, "
-                        "find the main application "
-                        "implementation file, read it and "
-                        "explain how it works: "
-                        f"{repository_url}"
-                    )
-
+            if cancel:
 
                 st.session_state.github_action = None
 
                 st.rerun()
 
 
+            if submit:
+
+                repository_url = (
+                    repository_url.strip()
+                )
+
+
+                if not repository_url:
+
+                    st.warning(
+                        "Enter a GitHub repository URL."
+                    )
+
+
+                elif not repository_url.startswith(
+                    (
+                        "https://github.com/",
+                        "http://github.com/",
+                    )
+                ):
+
+                    st.warning(
+                        "Enter a valid GitHub repository URL."
+                    )
+
+
+                else:
+
+                    run_prompt(
+                        "Explore this GitHub repository "
+                        "using GitHub tools. Inspect the "
+                        "repository tree, identify the main "
+                        "implementation files, read the "
+                        "actual source code and explain how "
+                        "the project works. Do not guess "
+                        "uninspected files: "
+                        f"{repository_url}"
+                    )
+
+                    st.session_state.github_action = None
+
+                    st.rerun()
+
+
+    # -----------------------------------------------------
+    # REVIEW PROJECT / DEPENDENCIES
+    # -----------------------------------------------------
+
+    elif action in {
+        "review",
+        "dependencies",
+    }:
+
+        if action == "review":
+
+            st.markdown(
+                "#### 🔍 Review Project"
+            )
+
+            st.caption(
+                "Review a GitHub repository or upload "
+                "a local/private repository as a ZIP."
+            )
+
+        else:
+
+            st.markdown(
+                "#### 📦 Check Dependencies"
+            )
+
+            st.caption(
+                "Check dependencies from a GitHub "
+                "repository or an uploaded ZIP project."
+            )
+
+
+        # -------------------------------------------------
+        # PROJECT SOURCE
+        # -------------------------------------------------
+
+        source = st.segmented_control(
+            "Project source",
+            options=[
+                "🐙 GitHub Repository",
+                "📁 Upload Repository",
+            ],
+            default="🐙 GitHub Repository",
+            selection_mode="single",
+            key=f"project_source_{action}",
+        )
+
+
+        # =================================================
+        # GITHUB SOURCE
+        # =================================================
+
+        if source == "🐙 GitHub Repository":
+
+            with st.form(
+                f"github_{action}_form",
+                clear_on_submit=True,
+            ):
+
+                repository_url = st.text_input(
+                    "GitHub repository URL",
+                    placeholder=(
+                        "https://github.com/user/project"
+                    ),
+                )
+
+
+                col1, col2 = st.columns(2)
+
+
+                with col1:
+
+                    submit = (
+                        st.form_submit_button(
+                            (
+                                "Review Project"
+                                if action == "review"
+                                else "Check Dependencies"
+                            ),
+                            type="primary",
+                            use_container_width=True,
+                        )
+                    )
+
+
+                with col2:
+
+                    cancel = (
+                        st.form_submit_button(
+                            "Cancel",
+                            use_container_width=True,
+                        )
+                    )
+
+
+                if cancel:
+
+                    st.session_state.github_action = None
+
+                    st.rerun()
+
+
+                if submit:
+
+                    repository_url = (
+                        repository_url.strip()
+                    )
+
+
+                    if not repository_url:
+
+                        st.warning(
+                            "Enter a GitHub repository URL."
+                        )
+
+
+                    elif not repository_url.startswith(
+                        (
+                            "https://github.com/",
+                            "http://github.com/",
+                        )
+                    ):
+
+                        st.warning(
+                            "Enter a valid GitHub repository URL."
+                        )
+
+
+                    else:
+
+                        if action == "review":
+
+                            run_prompt(
+                                "Review this GitHub repository. "
+                                "This is a GitHub repository, so "
+                                "use only the GitHub repository "
+                                "tools for repository inspection. "
+                                "First inspect the repository "
+                                "tree, then read important source "
+                                "and configuration files. Identify "
+                                "confirmed issues, potential "
+                                "issues and practical "
+                                "recommendations. Base findings "
+                                "only on files you actually "
+                                "inspect: "
+                                f"{repository_url}"
+                            )
+
+
+                        else:
+
+                            run_prompt(
+                                "Analyze the dependencies of this "
+                                "GitHub repository. This is a "
+                                "GitHub repository, so use GitHub "
+                                "tools rather than local "
+                                "filesystem tools. Inspect the "
+                                "repository tree and locate actual "
+                                "dependency files such as "
+                                "requirements.txt, pyproject.toml, "
+                                "Pipfile, poetry.lock, setup.py, "
+                                "setup.cfg or package.json. Read "
+                                "only files that actually exist "
+                                "and report dependency issues "
+                                "based on their contents: "
+                                f"{repository_url}"
+                            )
+
+
+                        st.session_state.github_action = None
+
+                        st.rerun()
+
+
+        # =================================================
+        # ZIP UPLOAD SOURCE
+        # =================================================
+
+        elif source == "📁 Upload Repository":
+
+            st.info(
+                "Upload your project as a `.zip` file. "
+                "Folders such as `.git`, `venv`, `.venv`, "
+                "`node_modules` and `__pycache__` are ignored."
+            )
+
+
+            uploaded_file = st.file_uploader(
+                "Upload project ZIP",
+                type=["zip"],
+                key=f"project_zip_{action}",
+                help=(
+                    f"Maximum ZIP size: "
+                    f"{MAX_ZIP_SIZE_MB} MB"
+                ),
+            )
+
+
+            col1, col2 = st.columns(2)
+
+
+            with col1:
+
+                analyze_uploaded = st.button(
+                    (
+                        "Review Uploaded Project"
+                        if action == "review"
+                        else "Check Uploaded Dependencies"
+                    ),
+                    type="primary",
+                    use_container_width=True,
+                    key=f"analyze_upload_{action}",
+                )
+
+
+            with col2:
+
+                cancel_upload = st.button(
+                    "Cancel",
+                    use_container_width=True,
+                    key=f"cancel_upload_{action}",
+                )
+
+
+            if cancel_upload:
+
+                st.session_state.github_action = None
+
+                st.rerun()
+
+
+            if analyze_uploaded:
+
+                if uploaded_file is None:
+
+                    st.warning(
+                        "Upload a project ZIP first."
+                    )
+
+
+                else:
+
+                    try:
+
+                        with st.spinner(
+                            "Preparing project..."
+                        ):
+
+                            project_path = (
+                                save_uploaded_project(
+                                    uploaded_file
+                                )
+                            )
+
+
+                        if action == "review":
+
+                            run_prompt(
+                                "Review the uploaded project "
+                                "located at this local filesystem "
+                                "directory:\n\n"
+                                f"{project_path}\n\n"
+                                "This is an extracted uploaded "
+                                "project, NOT a GitHub repository. "
+                                "Use the local project tools. "
+                                "Start with "
+                                "analyze_project_structure using "
+                                "the exact directory above. Then "
+                                "inspect relevant source files "
+                                "using read_file and "
+                                "analyze_python_code when useful. "
+                                "If requirements.txt exists, "
+                                "analyze dependencies using "
+                                "check_project_dependencies. "
+                                "Report confirmed issues, "
+                                "potential issues and practical "
+                                "recommendations. Do not inspect "
+                                "files outside this project "
+                                "directory."
+                            )
+
+
+                        else:
+
+                            requirements_path = os.path.join(
+                                project_path,
+                                "requirements.txt",
+                            )
+
+                            run_prompt(
+                                "Analyze dependencies for the "
+                                "uploaded project located at this "
+                                "local filesystem directory:\n\n"
+                                f"{project_path}\n\n"
+                                "This is an extracted uploaded "
+                                "project, NOT a GitHub repository. "
+                                "Use local project tools. Start "
+                                "with analyze_project_structure. "
+                                "If requirements.txt exists, use "
+                                "check_project_dependencies with "
+                                "these paths:\n\n"
+                                f"project_path = {project_path}\n"
+                                f"requirements_path = "
+                                f"{requirements_path}\n\n"
+                                "Do not assume requirements.txt "
+                                "exists. If the project uses a "
+                                "different dependency format, "
+                                "inspect that file and clearly "
+                                "explain the current tool "
+                                "limitation."
+                            )
+
+
+                        st.session_state.github_action = None
+
+                        st.rerun()
+
+
+                    except zipfile.BadZipFile:
+
+                        st.error(
+                            "The uploaded file is not a "
+                            "valid ZIP archive."
+                        )
+
+
+                    except ValueError as e:
+
+                        st.error(
+                            str(e)
+                        )
+
+
+                    except Exception as e:
+
+                        st.error(
+                            "Could not prepare the project: "
+                            f"{str(e)}"
+                        )
+
+
 # =========================================================
 # PYPI QUICK ACTION
 # =========================================================
-
-# This also intentionally comes AFTER existing messages.
 
 if st.session_state.package_action:
 
@@ -780,25 +1557,27 @@ if st.session_state.package_action:
         )
 
 
-        col1, col2 = st.columns(
-            [1, 1]
-        )
+        col1, col2 = st.columns(2)
 
 
         with col1:
 
-            check_package = st.form_submit_button(
-                "Check Package",
-                type="primary",
-                use_container_width=True,
+            check_package = (
+                st.form_submit_button(
+                    "Check Package",
+                    type="primary",
+                    use_container_width=True,
+                )
             )
 
 
         with col2:
 
-            cancel_package = st.form_submit_button(
-                "Cancel",
-                use_container_width=True,
+            cancel_package = (
+                st.form_submit_button(
+                    "Cancel",
+                    use_container_width=True,
+                )
             )
 
 
@@ -811,7 +1590,9 @@ if st.session_state.package_action:
 
         if check_package:
 
-            package_name = package_name.strip()
+            package_name = (
+                package_name.strip()
+            )
 
 
             if not package_name:
@@ -826,7 +1607,8 @@ if st.session_state.package_action:
                 run_prompt(
                     "Check the latest PyPI version of "
                     f"{package_name} and explain whether "
-                    "my installed version should be updated."
+                    "my installed version should be "
+                    "updated."
                 )
 
 
