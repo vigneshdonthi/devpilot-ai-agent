@@ -2,7 +2,7 @@ from dotenv import load_dotenv
 
 from langchain.agents import create_agent
 from langchain_mistralai import ChatMistralAI
-from langgraph.checkpoint.memory import InMemorySaver
+#from langgraph.checkpoint.memory import InMemorySaver
 
 from tools.file_reader import read_file
 from tools.project_analyzer import analyze_project_structure
@@ -365,16 +365,22 @@ tools = [
 # MEMORY
 # =========================================================
 
-memory = InMemorySaver()
+# memory = InMemorySaver()
 
 
 # =========================================================
 # AGENT
 # =========================================================
 
+#agent = create_agent(
+#    model=model,
+#    tools=tools,
+#    system_prompt=SYSTEM_PROMPT,
+#    checkpointer=memory,
+#)
+
 agent = create_agent(
     model=model,
     tools=tools,
     system_prompt=SYSTEM_PROMPT,
-    checkpointer=memory,
 )

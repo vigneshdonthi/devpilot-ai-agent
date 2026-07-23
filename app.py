@@ -1,7 +1,6 @@
 import os
 import shutil
 import tempfile
-import uuid
 import zipfile
 from pathlib import Path
 
@@ -9,6 +8,23 @@ import streamlit as st
 
 from agent import agent, model
 
+from database.auth import (
+    register_user,
+    login_user,
+    logout_user,
+    send_password_reset,
+    set_recovery_session,
+    update_password,
+)
+from database.chat_repository import (
+    create_chat as create_chat_db,
+    get_user_chats,
+    save_message,
+    get_chat_messages,
+    update_chat_title,
+    update_chat_mode,
+    delete_chat_from_db,
+)
 
 # =========================================================
 # CONFIG
@@ -75,6 +91,38 @@ st.markdown(
         margin-bottom: 20px;
     }
 
+    .sidebar-profile {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 10px 4px 6px 4px;
+    }
+
+    .sidebar-avatar {
+        width: 40px;
+        height: 40px;
+        border-radius: 50%;
+        background: rgba(128, 128, 128, 0.18);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 17px;
+        font-weight: 700;
+        flex-shrink: 0;
+    }
+
+    .sidebar-profile-name {
+        font-size: 15px;
+        font-weight: 650;
+        line-height: 1.2;
+    }
+
+    .sidebar-profile-status {
+        font-size: 12px;
+        opacity: 0.55;
+        margin-top: 3px;
+    }
+
     </style>
     """,
     unsafe_allow_html=True,
@@ -84,22 +132,27 @@ st.markdown(
 # =========================================================
 # SESSION STATE
 # =========================================================
-
+if "user" not in st.session_state:
+    st.session_state.user = None
 if "chats" not in st.session_state:
     st.session_state.chats = {}
+if "forgot_password" not in st.session_state:
+    st.session_state.forgot_password = False
 
+if "password_recovery" not in st.session_state:
+    st.session_state.password_recovery = False
+
+if "recovery_error" not in st.session_state:
+    st.session_state.recovery_error = None
+
+if "password_reset_success" not in st.session_state:
+    st.session_state.password_reset_success = False
 
 if "current_chat_id" not in st.session_state:
+    st.session_state.current_chat_id = None
 
-    chat_id = str(uuid.uuid4())
-
-    st.session_state.current_chat_id = chat_id
-
-    st.session_state.chats[chat_id] = {
-        "title": "New Chat",
-        "messages": [],
-        "mode": "Agent",
-    }
+if "chats_loaded_for_user" not in st.session_state:
+    st.session_state.chats_loaded_for_user = None
 
 
 if "pending_prompt" not in st.session_state:
@@ -123,18 +176,73 @@ if "uploaded_projects" not in st.session_state:
 # CHAT FUNCTIONS
 # =========================================================
 
+def load_user_chats():
+
+    if st.session_state.user is None:
+        return
+
+    user_id = str(st.session_state.user.id)
+    db_chats = get_user_chats(user_id)
+
+    st.session_state.chats = {}
+
+    for db_chat in db_chats:
+
+        chat_id = db_chat["id"]
+        db_messages = get_chat_messages(chat_id)
+
+        st.session_state.chats[chat_id] = {
+            "title": db_chat.get("title", "New Chat"),
+            "mode": db_chat.get("mode", "Agent"),
+            "messages": [
+                {
+                    "role": message["role"],
+                    "content": message["content"],
+                }
+                for message in db_messages
+            ],
+        }
+
+    if st.session_state.chats:
+        # get_user_chats() is ordered newest first.
+        st.session_state.current_chat_id = next(
+            iter(st.session_state.chats)
+        )
+    else:
+        st.session_state.current_chat_id = None
+
+    st.session_state.chats_loaded_for_user = user_id
+
+
 def create_new_chat():
 
-    chat_id = str(uuid.uuid4())
+    if st.session_state.user is None:
+        return
 
-    st.session_state.chats[chat_id] = {
-        "title": "New Chat",
-        "messages": [],
-        "mode": "Agent",
+    db_chat = create_chat_db(
+        user_id=str(st.session_state.user.id),
+        title="New Chat",
+        mode="Agent",
+    )
+
+    if not db_chat:
+        st.error("Could not create chat.")
+        return
+
+    chat_id = db_chat["id"]
+
+    # Put the newest chat first in the local cache.
+    new_chats = {
+        chat_id: {
+            "title": db_chat.get("title", "New Chat"),
+            "messages": [],
+            "mode": db_chat.get("mode", "Agent"),
+        }
     }
+    new_chats.update(st.session_state.chats)
+    st.session_state.chats = new_chats
 
     st.session_state.current_chat_id = chat_id
-
     st.session_state.pending_prompt = None
     st.session_state.github_action = None
     st.session_state.package_action = False
@@ -142,15 +250,20 @@ def create_new_chat():
 
 def get_current_chat():
 
-    return st.session_state.chats[
-        st.session_state.current_chat_id
-    ]
+    chat_id = st.session_state.current_chat_id
+
+    if chat_id is None:
+        return None
+
+    return st.session_state.chats.get(chat_id)
 
 
 def switch_chat(chat_id):
 
-    st.session_state.current_chat_id = chat_id
+    if chat_id not in st.session_state.chats:
+        return
 
+    st.session_state.current_chat_id = chat_id
     st.session_state.pending_prompt = None
     st.session_state.github_action = None
     st.session_state.package_action = False
@@ -158,17 +271,18 @@ def switch_chat(chat_id):
 
 def delete_chat(chat_id):
 
-    if chat_id in st.session_state.chats:
-        del st.session_state.chats[chat_id]
+    if not delete_chat_from_db(chat_id):
+        st.error("Could not delete chat.")
+        return
 
-    # Remove temporary uploaded project belonging to this chat.
+    st.session_state.chats.pop(chat_id, None)
+
     project_data = st.session_state.uploaded_projects.pop(
         chat_id,
         None,
     )
 
     if project_data:
-
         temp_directory = project_data.get("temp_directory")
 
         if temp_directory and os.path.isdir(temp_directory):
@@ -177,13 +291,32 @@ def delete_chat(chat_id):
                 ignore_errors=True,
             )
 
-    if not st.session_state.chats:
-        create_new_chat()
-
-    else:
+    if st.session_state.chats:
         st.session_state.current_chat_id = next(
-            reversed(st.session_state.chats)
+            iter(st.session_state.chats)
         )
+    else:
+        st.session_state.current_chat_id = None
+
+
+def clear_local_user_state():
+
+    for project_data in st.session_state.uploaded_projects.values():
+        temp_directory = project_data.get("temp_directory")
+
+        if temp_directory and os.path.isdir(temp_directory):
+            shutil.rmtree(
+                temp_directory,
+                ignore_errors=True,
+            )
+
+    st.session_state.chats = {}
+    st.session_state.current_chat_id = None
+    st.session_state.chats_loaded_for_user = None
+    st.session_state.uploaded_projects = {}
+    st.session_state.pending_prompt = None
+    st.session_state.github_action = None
+    st.session_state.package_action = False
 
 
 def run_prompt(prompt):
@@ -536,6 +669,309 @@ User message:
             or "New Chat"
         )
 
+# =========================================================
+# SUPABASE RECOVERY LINK BRIDGE
+# =========================================================
+
+st.html(
+    """
+    <script>
+    (() => {
+        const hash = window.location.hash;
+        if (!hash || hash.length <= 1) return;
+
+        const params = new URLSearchParams(hash.substring(1));
+        const accessToken = params.get("access_token");
+        const refreshToken = params.get("refresh_token");
+        const type = params.get("type");
+
+        if (type === "recovery" && accessToken && refreshToken) {
+            const url = new URL(window.location.href);
+            url.hash = "";
+            url.searchParams.set("recovery_access_token", accessToken);
+            url.searchParams.set("recovery_refresh_token", refreshToken);
+            window.location.replace(url.toString());
+        }
+    })();
+    </script>
+    """,
+    unsafe_allow_javascript=True,
+)
+
+recovery_access_token = st.query_params.get("recovery_access_token")
+recovery_refresh_token = st.query_params.get("recovery_refresh_token")
+
+if recovery_access_token and recovery_refresh_token:
+
+    result = set_recovery_session(
+        recovery_access_token,
+        recovery_refresh_token,
+    )
+
+    st.query_params.clear()
+
+    if result["success"]:
+        st.session_state.user = None
+        st.session_state.forgot_password = False
+        st.session_state.password_recovery = True
+        st.session_state.recovery_error = None
+        st.rerun()
+
+    else:
+        st.session_state.password_recovery = False
+        st.session_state.recovery_error = (
+            result["error"]
+            or "The password reset link is invalid or expired."
+        )
+        st.rerun()
+
+
+# =========================================================
+# AUTHENTICATION
+# =========================================================
+
+if st.session_state.user is None:
+
+    st.markdown("# ⚡ DevPilot")
+    st.caption("AI Developer Assistant")
+
+    if st.session_state.password_recovery:
+
+        st.markdown("### Set new password")
+        st.caption("Choose a new password for your DevPilot account.")
+
+        with st.form("new_password_form"):
+
+            new_password = st.text_input(
+                "New password",
+                type="password",
+            )
+
+            confirm_new_password = st.text_input(
+                "Confirm new password",
+                type="password",
+            )
+
+            update_password_button = st.form_submit_button(
+                "Update Password",
+                type="primary",
+                use_container_width=True,
+            )
+
+            if update_password_button:
+
+                if not new_password:
+                    st.warning("Enter a new password.")
+
+                elif len(new_password) < 6:
+                    st.error("Password must be at least 6 characters.")
+
+                elif new_password != confirm_new_password:
+                    st.error("Passwords do not match.")
+
+                else:
+                    result = update_password(new_password)
+
+                    if result["success"]:
+                        logout_user()
+                        st.session_state.password_recovery = False
+                        st.session_state.forgot_password = False
+                        st.session_state.recovery_error = None
+                        st.session_state.password_reset_success = True
+                        st.session_state.user = None
+                        st.rerun()
+
+                    else:
+                        st.error(result["error"])
+
+        st.stop()
+
+    if st.session_state.recovery_error:
+        st.error(st.session_state.recovery_error)
+        st.session_state.recovery_error = None
+
+    if st.session_state.password_reset_success:
+        st.success(
+            "Password updated successfully. "
+            "Log in with your new password."
+        )
+        st.session_state.password_reset_success = False
+
+    if st.session_state.forgot_password:
+
+        st.markdown("### Reset your password")
+        st.caption(
+            "Enter your account email. Supabase will "
+            "send you a password-reset link."
+        )
+
+        with st.form("forgot_password_form"):
+
+            reset_email = st.text_input(
+                "Email",
+                placeholder="you@example.com",
+            )
+
+            send_reset = st.form_submit_button(
+                "Send reset link",
+                type="primary",
+                use_container_width=True,
+            )
+
+            if send_reset:
+
+                reset_email = reset_email.strip()
+
+                if not reset_email:
+                    st.warning("Enter your email address.")
+
+                else:
+                    result = send_password_reset(reset_email)
+
+                    if result["success"]:
+                        st.success(
+                            "If an account exists for that email, "
+                            "check your inbox for the password-reset link."
+                        )
+                    else:
+                        st.error(result["error"])
+
+        if st.button(
+            "← Back to login",
+            use_container_width=True,
+        ):
+            st.session_state.forgot_password = False
+            st.session_state.recovery_error = None
+            st.rerun()
+
+        st.stop()
+
+    st.markdown("### Welcome to DevPilot")
+
+    auth_mode = st.segmented_control(
+        "Account",
+        options=["Login", "Register"],
+        default="Login",
+    )
+
+    if auth_mode == "Login":
+
+        with st.form("login_form"):
+
+            email = st.text_input(
+                "Email",
+                placeholder="you@example.com",
+            )
+
+            password = st.text_input(
+                "Password",
+                type="password",
+            )
+
+            login_button = st.form_submit_button(
+                "Login",
+                type="primary",
+                use_container_width=True,
+            )
+
+            if login_button:
+
+                if not email or not password:
+                    st.warning("Enter your email and password.")
+
+                else:
+                    result = login_user(
+                        email.strip(),
+                        password,
+                    )
+
+                    if result["success"]:
+                        st.session_state.user = result["user"]
+                        load_user_chats()
+                        st.success("Login successful.")
+                        st.rerun()
+                    else:
+                        st.error("Invalid email or password.")
+
+        if st.button(
+            "Forgot password?",
+            use_container_width=True,
+        ):
+            st.session_state.forgot_password = True
+            st.session_state.recovery_error = None
+            st.rerun()
+
+    else:
+
+        with st.form("register_form"):
+
+            email = st.text_input(
+                "Email",
+                placeholder="you@example.com",
+            )
+
+            password = st.text_input(
+                "Password",
+                type="password",
+            )
+
+            confirm_password = st.text_input(
+                "Confirm password",
+                type="password",
+            )
+
+            register_button = st.form_submit_button(
+                "Create Account",
+                type="primary",
+                use_container_width=True,
+            )
+
+            if register_button:
+
+                if not email or not password:
+                    st.warning("Enter your email and password.")
+
+                elif password != confirm_password:
+                    st.error("Passwords do not match.")
+
+                elif len(password) < 6:
+                    st.error("Password must be at least 6 characters.")
+
+                else:
+                    result = register_user(
+                        email.strip(),
+                        password,
+                    )
+
+                    if result["success"]:
+
+                        if result["session"]:
+                            st.session_state.user = result["user"]
+                            load_user_chats()
+                            st.success("Account created successfully.")
+                            st.rerun()
+                        else:
+                            st.success(
+                                "Account created. Please log in."
+                            )
+                    else:
+                        st.error(result["error"])
+
+    st.stop()
+
+
+# =========================================================
+# LOAD AUTHENTICATED USER DATA
+# =========================================================
+
+current_user_id = str(st.session_state.user.id)
+
+if st.session_state.chats_loaded_for_user != current_user_id:
+    load_user_chats()
+
+if st.session_state.current_chat_id is None:
+    create_new_chat()
+
 
 # =========================================================
 # SIDEBAR
@@ -543,11 +979,13 @@ User message:
 
 with st.sidebar:
 
+    # -----------------------------------------------------
+    # HEADER
+    # -----------------------------------------------------
+
     st.markdown("## ⚡ DevPilot")
 
-    st.caption(
-        "AI Developer Assistant"
-    )
+    st.caption("AI Developer Assistant")
 
 
     # -----------------------------------------------------
@@ -577,6 +1015,10 @@ with st.sidebar:
     )
 
 
+    # -----------------------------------------------------
+    # EXPLORE GITHUB
+    # -----------------------------------------------------
+
     if st.button(
         "🐙 Explore GitHub",
         use_container_width=True,
@@ -591,6 +1033,10 @@ with st.sidebar:
         st.rerun()
 
 
+    # -----------------------------------------------------
+    # EXPLAIN GITHUB CODE
+    # -----------------------------------------------------
+
     if st.button(
         "📖 Explain GitHub Code",
         use_container_width=True,
@@ -603,6 +1049,10 @@ with st.sidebar:
         st.rerun()
 
 
+    # -----------------------------------------------------
+    # REVIEW PROJECT
+    # -----------------------------------------------------
+
     if st.button(
         "🔍 Review Project",
         use_container_width=True,
@@ -614,6 +1064,10 @@ with st.sidebar:
 
         st.rerun()
 
+
+    # -----------------------------------------------------
+    # CHECK DEPENDENCIES
+    # -----------------------------------------------------
 
     if st.button(
         "📦 Check Dependencies",
@@ -628,6 +1082,10 @@ with st.sidebar:
 
         st.rerun()
 
+
+    # -----------------------------------------------------
+    # CHECK PYPI
+    # -----------------------------------------------------
 
     if st.button(
         "🔄 Check PyPI Package",
@@ -704,6 +1162,59 @@ with st.sidebar:
                 st.rerun()
 
 
+    # -----------------------------------------------------
+    # USER PROFILE
+    # -----------------------------------------------------
+
+    st.divider()
+
+    email = st.session_state.user.email or "User"
+    username = email.split("@")[0]
+
+    display_name = (
+        username
+        .replace(".", " ")
+        .replace("_", " ")
+        .replace("-", " ")
+        .title()
+    )
+
+    if not display_name:
+        display_name = "User"
+
+    profile_initial = display_name[0].upper()
+
+    st.markdown(
+        f"""
+        <div class="sidebar-profile">
+            <div class="sidebar-avatar">
+                {profile_initial}
+            </div>
+            <div>
+                <div class="sidebar-profile-name">
+                    {display_name}
+                </div>
+                <div class="sidebar-profile-status">
+                    Signed in
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if st.button(
+        "🚪 Logout",
+        use_container_width=True,
+        key="sidebar_logout",
+    ):
+
+        logout_user()
+        clear_local_user_state()
+        st.session_state.user = None
+        st.rerun()
+
+
 # =========================================================
 # CURRENT CHAT
 # =========================================================
@@ -725,7 +1236,6 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
-
 
 st.markdown(
     """
@@ -766,11 +1276,18 @@ if not messages:
     )
 
 
-    if mode == "⚡ Agent":
-        chat["mode"] = "Agent"
+    selected_mode = (
+        "Agent"
+        if mode == "⚡ Agent"
+        else "Chat"
+    )
 
-    elif mode == "💬 Chat":
-        chat["mode"] = "Chat"
+    if selected_mode != chat["mode"]:
+        chat["mode"] = selected_mode
+        update_chat_mode(
+            st.session_state.current_chat_id,
+            selected_mode,
+        )
 
 
 # =========================================================
@@ -1658,6 +2175,11 @@ if prompt:
                 prompt
             )
 
+            update_chat_title(
+                st.session_state.current_chat_id,
+                chat["title"],
+            )
+
 
         # =================================================
         # SAVE USER MESSAGE
@@ -1668,6 +2190,12 @@ if prompt:
                 "role": "user",
                 "content": prompt,
             }
+        )
+
+        save_message(
+            st.session_state.current_chat_id,
+            "user",
+            prompt,
         )
 
 
@@ -1695,12 +2223,16 @@ if prompt:
 
             if chat["mode"] == "Agent":
 
-                config = {
-                    "configurable": {
-                        "thread_id":
-                            st.session_state.current_chat_id
+                # Build agent context from the messages loaded
+                # from Supabase for this chat. The newest user
+                # prompt is already present in `messages`.
+                agent_messages = [
+                    {
+                        "role": message["role"],
+                        "content": message["content"],
                     }
-                }
+                    for message in messages
+                ]
 
 
                 status = st.status(
@@ -1718,14 +2250,8 @@ if prompt:
 
                     stream = agent.stream(
                         {
-                            "messages": [
-                                {
-                                    "role": "user",
-                                    "content": prompt,
-                                }
-                            ]
+                            "messages": agent_messages
                         },
-                        config=config,
                         stream_mode=[
                             "updates",
                             "messages",
@@ -1866,32 +2392,6 @@ if prompt:
                                 )
 
 
-                    # =========================================
-                    # FALLBACK
-                    # =========================================
-
-                    if not final_response:
-
-                        state = agent.get_state(
-                            config
-                        )
-
-
-                        state_messages = (
-                            state.values.get(
-                                "messages",
-                                []
-                            )
-                        )
-
-
-                        if state_messages:
-
-                            final_response = (
-                                state_messages[-1].content
-                            )
-
-
                     response_placeholder.markdown(
                         final_response
                     )
@@ -2024,6 +2524,12 @@ if prompt:
                 "role": "assistant",
                 "content": final_response,
             }
+        )
+
+        save_message(
+            st.session_state.current_chat_id,
+            "assistant",
+            final_response,
         )
 
 
